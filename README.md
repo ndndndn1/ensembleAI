@@ -94,6 +94,7 @@ Common flags:
 
 | Flag                        | Default          | Meaning                                               |
 | --------------------------- | ---------------- | ----------------------------------------------------- |
+| `-i, --image PATH`          | none             | attach an image to every agent prompt (codex `--image`, gemini `@PATH`, claude inline path) |
 | `-r, --rounds N`            | `1`              | debate rounds **after** round 1                       |
 | `-a, --agents LIST`         | auto-detect      | comma-separated subset of `codex,claude,gemini`       |
 | `-j, --judge NAME`          | `claude`         | which agent acts as judge                             |
@@ -114,7 +115,13 @@ Examples:
 
 # Self-consistency: claude answers 5 times in parallel and we vote
 ./ensemble.sh -m self-consistency -a claude --self-n 5 "Estimate Q3 churn risk drivers."
+
+# Image input: all three CLIs reason about the same picture
+./ensemble.sh --image img/temp.png "Explain what this image shows."
 ```
+
+A worked image-debate example with the exact reference commands and the
+captured transcript is in [`examples/debate-img-temp-png.md`](examples/debate-img-temp-png.md).
 
 ## Output
 
