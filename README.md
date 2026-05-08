@@ -6,11 +6,31 @@ with majority voting and a judge model to produce a single optimal conclusion.
 
 No API keys. No sandbox. Just the three CLIs you already log into:
 
-```
-codex  exec  --yolo                       "<prompt>"
-claude -p    --dangerously-skip-permissions "<prompt>"
-gemini -p    --approval-mode=yolo         "<prompt>"
-```
+
+## commercial subscription AI setting
+
+npm i @openai/codex
+npm install @google/gemini-cli
+curl -fsSL https://claude.ai/install.sh | bash
+
+codexe () {
+  npx codex exec --yolo "$@"
+}
+alias gemini="npx gemini --approval-mode=yolo"
+alias claude="claude --dangerously-skip-permissions"
+
+echo "explain" | codexe --image img/temp.png -
+gemini -p "@img/temp.png explain"
+claude -p "img/temp.png explain"
+
+/exit
+/exit
+exit
+
+## commercial AI docs
+codex [cli,img](https://developers.openai.com/codex/cli/reference#codex-exec)
+gemini [img](https://geminicli.com/docs/cli/tutorials/file-management/#how-to-modify-code) [cli](https://geminicli.com/docs/cli/cli-reference/#cli-commands)
+claude [cli](https://code.claude.com/docs/en/cli-reference#cli-commands) img tag needless
 
 ## Protocol
 
