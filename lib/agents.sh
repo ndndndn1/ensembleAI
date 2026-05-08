@@ -13,10 +13,17 @@
 : "${GEMINI_BIN:=gemini}"
 
 : "${CODEX_ARGS:=exec --yolo}"
-: "${CLAUDE_ARGS:=-p --dangerously-skip-permissions}"
-: "${GEMINI_ARGS:=-p --approval-mode=yolo}"
+: "${CLAUDE_ARGS:=--dangerously-skip-permissions -p}"
+: "${GEMINI_ARGS:=--approval-mode=yolo}"
 
 : "${AGENT_TIMEOUT:=600}"  # per-call timeout in seconds
+
+# IMAGE_PATH: if set, the runners attach the image to the agent's input using
+# each CLI's native syntax:
+#   - codex:  --image <PATH> ; prompt is piped via stdin (using `-`)
+#   - gemini: @<PATH> prefix in the -p prompt
+#   - claude: <PATH> prefix in the positional prompt (auto-detected)
+: "${IMAGE_PATH:=}"
 
 # -------- helpers --------
 
@@ -37,22 +44,37 @@ _run_with_timeout() {
 agent_codex() {
   local prompt
   prompt="$(cat)"
-  # codex exec reads the prompt as a positional argument.
-  _run_with_timeout "$AGENT_TIMEOUT" "$CODEX_BIN" $CODEX_ARGS "$prompt"
+  if [[ -n "$IMAGE_PATH" ]]; then
+    # `--image` attaches the image; `-` reads the prompt from stdin.
+    printf '%s\n' "$prompt" \
+      | _run_with_timeout "$AGENT_TIMEOUT" "$CODEX_BIN" $CODEX_ARGS --image "$IMAGE_PATH" -
+  else
+    _run_with_timeout "$AGENT_TIMEOUT" "$CODEX_BIN" $CODEX_ARGS "$prompt"
+  fi
 }
 
 agent_claude() {
   local prompt
   prompt="$(cat)"
-  # claude -p accepts the prompt as a positional argument.
-  _run_with_timeout "$AGENT_TIMEOUT" "$CLAUDE_BIN" $CLAUDE_ARGS "$prompt"
+  # The prompt is the trailing positional argument.
+  if [[ -n "$IMAGE_PATH" ]]; then
+    # claude auto-detects local file paths in the prompt (no special flag).
+    _run_with_timeout "$AGENT_TIMEOUT" "$CLAUDE_BIN" $CLAUDE_ARGS "$IMAGE_PATH $prompt"
+  else
+    _run_with_timeout "$AGENT_TIMEOUT" "$CLAUDE_BIN" $CLAUDE_ARGS "$prompt"
+  fi
 }
 
 agent_gemini() {
   local prompt
   prompt="$(cat)"
-  # gemini -p accepts the prompt as a flag value.
-  _run_with_timeout "$AGENT_TIMEOUT" "$GEMINI_BIN" $GEMINI_ARGS "$prompt"
+  # `-p` must come last so its value (the prompt) is not stolen by another flag.
+  if [[ -n "$IMAGE_PATH" ]]; then
+    # gemini uses the `@<path>` prefix inside the prompt to attach files.
+    _run_with_timeout "$AGENT_TIMEOUT" "$GEMINI_BIN" $GEMINI_ARGS -p "@$IMAGE_PATH $prompt"
+  else
+    _run_with_timeout "$AGENT_TIMEOUT" "$GEMINI_BIN" $GEMINI_ARGS -p "$prompt"
+  fi
 }
 
 # Dispatcher: agent_run <name>

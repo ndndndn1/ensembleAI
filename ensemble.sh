@@ -13,6 +13,8 @@
 #
 # Options:
 #   -f, --file PATH        read topic from file
+#   -i, --image PATH       attach an image to every agent prompt (uses each
+#                          CLI's native image syntax)
 #   -r, --rounds N         number of debate rounds after round 1 (default 1)
 #   -a, --agents LIST      comma-separated subset of: codex,claude,gemini
 #                          (default: all available)
@@ -41,6 +43,7 @@ SELF_N=3
 OUT_DIR=""
 TOPIC_FILE=""
 TOPIC_INLINE=""
+IMAGE_OPT=""
 NO_JUDGE=0
 DRY_RUN=0
 
@@ -55,6 +58,7 @@ positional=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|--file)    TOPIC_FILE="$2"; shift 2 ;;
+    -i|--image)   IMAGE_OPT="$2"; shift 2 ;;
     -r|--rounds)  ROUNDS="$2"; shift 2 ;;
     -a|--agents)  AGENTS_INPUT="$2"; shift 2 ;;
     -j|--judge)   JUDGE="$2"; shift 2 ;;
@@ -99,6 +103,15 @@ if [[ -z "${TOPIC//[[:space:]]/}" ]]; then
   exit 2
 fi
 
+# Validate and export the image path so the agent runners pick it up.
+if [[ -n "$IMAGE_OPT" ]]; then
+  if [[ ! -r "$IMAGE_OPT" ]]; then
+    echo "error: image not readable: $IMAGE_OPT" >&2
+    exit 2
+  fi
+  export IMAGE_PATH="$IMAGE_OPT"
+fi
+
 # -------- decide agents --------
 ALL_AGENTS=(codex claude gemini)
 if [[ -n "$AGENTS_INPUT" ]]; then
@@ -130,10 +143,11 @@ printf '%s\n' "$TOPIC" > "$OUT_DIR/topic.md"
   echo "rounds: $ROUNDS"
   echo "judge: $JUDGE"
   echo "self_n: $SELF_N"
+  echo "image: ${IMAGE_PATH:-}"
 } > "$OUT_DIR/run.meta"
 
 echo ">>> ensembleAI run: $OUT_DIR" >&2
-echo ">>> mode=$MODE  agents=${AGENTS[*]}  rounds=$ROUNDS  judge=$JUDGE" >&2
+echo ">>> mode=$MODE  agents=${AGENTS[*]}  rounds=$ROUNDS  judge=$JUDGE  image=${IMAGE_PATH:-none}" >&2
 
 # -------- prompt builders --------
 render() {
