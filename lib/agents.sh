@@ -14,9 +14,24 @@
 
 : "${CODEX_ARGS:=exec --yolo}"
 : "${CLAUDE_ARGS:=--dangerously-skip-permissions -p}"
-: "${GEMINI_ARGS:=--approval-mode=yolo}"
+# `--skip-trust` lets gemini run in untrusted/headless directories (e.g. CI,
+# /tmp, codespaces) without prompting; equivalent to GEMINI_CLI_TRUST_WORKSPACE=1.
+: "${GEMINI_ARGS:=--approval-mode=yolo --skip-trust}"
 
 : "${AGENT_TIMEOUT:=600}"  # per-call timeout in seconds
+
+# Env vars set by an outer Claude Code session that, if inherited by the
+# spawned `claude` subprocess, cause it to fail silently / refuse to start a
+# new session. We strip them on every claude invocation (idempotent — no
+# effect if they aren't set).
+_CLAUDE_NESTED_ENV_STRIP=(
+  CLAUDECODE
+  CLAUDE_CODE_SESSION_ID
+  CLAUDE_CODE_ENTRYPOINT
+  CLAUDE_CODE_EXECPATH
+  CLAUDE_EFFORT
+  AI_AGENT
+)
 
 # IMAGE_PATH: if set, the runners attach the image to the agent's input using
 # each CLI's native syntax:
@@ -56,12 +71,20 @@ agent_codex() {
 agent_claude() {
   local prompt
   prompt="$(cat)"
+  # Strip any inherited Claude Code session env vars before invoking the CLI.
+  # Without this, a nested `claude` spawned from inside Claude Code exits
+  # silently (empty stderr, non-zero rc) instead of starting a fresh session.
+  local strip=()
+  local v
+  for v in "${_CLAUDE_NESTED_ENV_STRIP[@]}"; do
+    strip+=(-u "$v")
+  done
   # The prompt is the trailing positional argument.
   if [[ -n "$IMAGE_PATH" ]]; then
     # claude auto-detects local file paths in the prompt (no special flag).
-    _run_with_timeout "$AGENT_TIMEOUT" "$CLAUDE_BIN" $CLAUDE_ARGS "$IMAGE_PATH $prompt"
+    _run_with_timeout "$AGENT_TIMEOUT" env "${strip[@]}" "$CLAUDE_BIN" $CLAUDE_ARGS "$IMAGE_PATH $prompt"
   else
-    _run_with_timeout "$AGENT_TIMEOUT" "$CLAUDE_BIN" $CLAUDE_ARGS "$prompt"
+    _run_with_timeout "$AGENT_TIMEOUT" env "${strip[@]}" "$CLAUDE_BIN" $CLAUDE_ARGS "$prompt"
   fi
 }
 

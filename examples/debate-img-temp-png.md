@@ -55,55 +55,214 @@ PATH` to attach the image to **every** agent prompt across all rounds:
 ```
 
 Internally `lib/agents.sh` routes the image to each CLI with its native
-syntax:
+syntax. The two flagged with † use fixes documented in section 3 below:
 
-| Agent  | Effective command (per round)                                         |
-| ------ | --------------------------------------------------------------------- |
-| codex  | `printf '%s\n' "$prompt" \| codex exec --yolo --image img/temp.png -` |
-| claude | `claude --dangerously-skip-permissions -p "img/temp.png $prompt"`     |
-| gemini | `gemini --approval-mode=yolo -p "@img/temp.png $prompt"`              |
+| Agent  | Effective command (per round)                                                       |
+| ------ | ----------------------------------------------------------------------------------- |
+| codex  | `printf '%s\n' "$prompt" \| codex exec --yolo --image img/temp.png -`               |
+| claude † | `env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID … claude --dangerously-skip-permissions -p "img/temp.png $prompt"` |
+| gemini † | `gemini --approval-mode=yolo --skip-trust -p "@img/temp.png $prompt"`             |
 
-## 3. Live run output (this sandbox)
+## 3. Common runtime issues and fixes
 
-This sandbox has the CLIs installed via `npm install` (`@openai/codex`,
-`@google/gemini-cli`, plus `claude` from the official installer) but **no
-subscription credentials** are available, so all three agents fail at the
-auth step. The orchestrator handles this gracefully — each agent's slot is
-filled with a synthetic `STRUCTURED` block reading "agent failed", the
-majority vote degenerates to a 3-way tie, and the judge step likewise
-fails, so `final.md` is emitted as a vote-only fallback.
+Two environment-specific problems surfaced when reproducing this example
+inside a Codespaces / sandbox environment. Both are now handled by
+`lib/agents.sh` so the orchestrator works out-of-the-box; this section
+documents *what* breaks and *how* the wrapper fixes it, in case the user
+hits the same symptoms invoking the CLIs directly.
 
-Captured stderr from `runs/img-debate/round1/`:
+### 3.1 Gemini — "untrusted folder" refusal
+
+**Symptom** (stderr from `gemini`):
 
 ```text
-# codex.err
-OpenAI Codex v0.129.0 (research preview)
-ERROR: unexpected status 401 Unauthorized: Missing bearer or basic
-authentication in header, url: https://api.openai.com/v1/responses
-
-# gemini.err
-Please set an Auth method in your /root/.gemini/settings.json or specify
-one of the following environment variables before running: GEMINI_API_KEY,
-GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GCA
-
-# claude.err
---dangerously-skip-permissions cannot be used with root/sudo privileges
-for security reasons
+Approval mode overridden to "default" because the current folder is not trusted.
+Gemini CLI is not running in a trusted directory. To proceed, either use
+`--skip-trust`, set the `GEMINI_CLI_TRUST_WORKSPACE=true` environment
+variable, or trust this directory in interactive mode.
 ```
 
-When the user re-runs the same command on a workstation where all three
-CLIs are logged in (and not running as root for `claude`), the same
-`runs/<timestamp>/` layout will be produced with real per-agent answers,
-a real majority vote, and a real judge synthesis.
+This happens whenever `gemini` is invoked headlessly from a directory it
+hasn't been told to trust (CI runners, fresh worktrees under `/tmp`,
+codespaces, etc.). YOLO mode alone is not enough — the trust check is
+independent of the approval policy.
 
-## 4. Stand-in deliberation (multimodal, Claude Opus 4.7)
+**Fix.** Pass `--skip-trust`. `lib/agents.sh` now bakes it into the
+default `GEMINI_ARGS`:
 
-Because the three live CLIs cannot authenticate in this environment, the
-following debate is performed by a **single multimodal model** taking on
-each agent role in sequence, with the same Round 1 / Debate / Judge
-protocol the orchestrator would use. This is *not* a substitute for the
-real ensemble — it is provided so the example file is informative rather
-than empty.
+```sh
+: "${GEMINI_ARGS:=--approval-mode=yolo --skip-trust}"
+```
+
+Equivalently, exporting `GEMINI_CLI_TRUST_WORKSPACE=true` in the parent
+shell also works. `--skip-trust` is preferred because it scopes the
+relaxation to the single invocation rather than the whole shell session.
+
+### 3.2 Claude — nested-session / silent-exit when running inside Claude Code
+
+**Symptom.** When `claude --dangerously-skip-permissions -p …` is spawned
+*from within* an existing Claude Code session (e.g. you ran the
+orchestrator from inside a Claude Code terminal), the child process exits
+non-zero with **empty stderr** and produces no output. There is no
+"please log in" or "permissions denied" message — it just dies quietly.
+
+**Cause.** Claude Code exports a number of session-marker env vars that
+the spawned `claude` CLI inherits and treats as "I'm already inside a
+session, don't start a new one":
+
+| Env var | Source |
+| ------- | ------ |
+| `CLAUDECODE=1` | Claude Code main marker |
+| `CLAUDE_CODE_SESSION_ID` | UUID of the parent session |
+| `CLAUDE_CODE_ENTRYPOINT` | `cli` / `vscode` / etc. |
+| `CLAUDE_CODE_EXECPATH` | path of parent CLI binary |
+| `CLAUDE_EFFORT` | inherited reasoning level |
+| `AI_AGENT` | `claude-code_<ver>_agent` |
+
+(This is a stricter sibling of the *"`--dangerously-skip-permissions`
+cannot be used with root/sudo privileges"* error you get when running as
+root — same defensive design, different trigger.)
+
+**Fix.** Strip those variables from the spawned process's environment
+using `env -u`. `lib/agents.sh` now does this for every `claude` call:
+
+```sh
+# Excerpt — see lib/agents.sh:agent_claude.
+_CLAUDE_NESTED_ENV_STRIP=(
+  CLAUDECODE
+  CLAUDE_CODE_SESSION_ID
+  CLAUDE_CODE_ENTRYPOINT
+  CLAUDE_CODE_EXECPATH
+  CLAUDE_EFFORT
+  AI_AGENT
+)
+
+strip=()
+for v in "${_CLAUDE_NESTED_ENV_STRIP[@]}"; do strip+=(-u "$v"); done
+
+env "${strip[@]}" claude --dangerously-skip-permissions -p "$prompt"
+```
+
+The stripped subprocess starts a fresh session, picks up the user's
+keychain credentials normally, and returns answers as expected.
+
+> Do **not** use `claude --bare` for this — `--bare` *also* skips the
+> keychain (it expects `ANTHROPIC_API_KEY` or `apiKeyHelper`), so a
+> subscription-mode user gets a `Not logged in · Please run /login`
+> error. Stripping the inherited session env vars is the right fix for
+> nested subscription-mode calls.
+
+### 3.3 Quick standalone-CLI smoke tests (after fixes)
+
+Once the wrappers are in place, you can verify each CLI directly:
+
+```sh
+# codex — works as-is
+echo "in one short sentence, what is this?" | codex exec --yolo --image img/temp.png -
+
+# gemini — needs --skip-trust in untrusted dirs
+gemini --approval-mode=yolo --skip-trust -p "@img/temp.png in one short sentence, what is this?"
+
+# claude — needs CLAUDECODE et al. unset when called from inside Claude Code
+env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT \
+    -u CLAUDE_CODE_EXECPATH -u CLAUDE_EFFORT -u AI_AGENT \
+    claude --dangerously-skip-permissions -p "img/temp.png in one short sentence, what is this?"
+```
+
+All three return a single-sentence identification of the device as a
+cross-section of a conventional NPN BJT.
+
+## 4. Verified live run output
+
+After applying the section-3 fixes, all three agents authenticate and
+return real answers. The run below was produced from this repo with:
+
+```sh
+PATH="$PWD/node_modules/.bin:$PATH" CLAUDE_BIN=claude \
+./ensemble.sh \
+    --image img/temp.png \
+    --agents codex,claude,gemini \
+    --rounds 0 \
+    --judge claude \
+    -o runs/full-test \
+    "Explain what this image shows. Identify the device, label its regions/terminals, and list typical applications."
+```
+
+(`--rounds 0` runs Round 1 only — a single independent answer per agent
+plus the judge. Use `--rounds 1` or higher for actual debate rounds.)
+
+### Per-agent Round-1 conclusions (verbatim)
+
+```
+codex:  The image shows a cross-section of a conventional integrated NPN
+        bipolar junction transistor with labeled base, emitter, collector,
+        isolation, epitaxial, buried-layer, and substrate regions.
+
+claude: The image is a cross-section of a monolithic IC NPN bipolar
+        junction transistor showing the standard planar/epitaxial
+        structure with junction isolation, a buried n⁺⁺ collector layer,
+        and aluminum contacts to the Base, Emitter, and Collector.
+
+gemini: The image shows a cross-sectional view of a conventional NPN
+        Bipolar Junction Transistor (BJT) fabricated within an integrated
+        circuit environment using a planar process.
+```
+
+The vote step reports a 3-way phrasing split (the normalized strings
+differ), but the judge correctly recognizes substantive agreement.
+
+### Judge synthesis (excerpt — full text in `runs/full-test/final.md`)
+
+> **Consensus.** All three agents agree on the core identification: the
+> image is a **cross-section of a monolithic integrated NPN bipolar
+> junction transistor (BJT)** built by a planar epitaxial process. They
+> agree on three terminals (B, E, C) with aluminum metallization through
+> SiO₂ contact windows; the vertical NPN stack n⁺⁺ emitter / p base /
+> n epitaxial collector; an n⁺⁺ buried layer lowering collector series
+> resistance; p⁺ isolation diffusions plus the p substrate providing
+> junction isolation; and a standard application set (analog amplifiers,
+> current mirrors, references, RF/IF, switching, bipolar logic).
+>
+> The "disagreement" flagged by majority vote is purely surface phrasing.
+> Claude's answer is the most precise — it distinguishes the p⁺ surface
+> diffusion as the **base ohmic contact** (not the active base), names
+> the right-hand n⁺⁺ as a **collector sinker**, and explains *why* the
+> buried layer matters (lateral low-resistance path, lower V_CE(sat)).
+> Codex and gemini are correct subsets of the same picture.
+
+```
+=== FINAL ===
+ANSWER: Cross-sectional schematic of a conventional vertical NPN BJT
+fabricated in a monolithic silicon IC using a planar epitaxial process
+with junction isolation. Terminals B/E/C are aluminum contacts through
+SiO2 windows to a p+ base ohmic tap, an n++ emitter diffusion, and an
+n++ collector sinker, respectively. Active stack is n++ emitter / p
+base / n epi collector with an n++ buried layer providing the low-
+resistance return to the C contact; outer p+ ribs plus the p substrate
+form the reverse-biased junction-isolation cage. Typical uses: analog
+amplifiers, op-amps, current mirrors, bandgap references, RF/IF gain
+stages, ECL/TTL logic, and the bipolar element in BiCMOS.
+RATIONALE: All three agents reached the same identification; differences
+were in level of detail, not correctness. Synthesis adopts claude's
+precision (sinker, base ohmic vs. intrinsic base distinction, buried-
+layer rationale) layered over the labeling inventory shared by all three.
+DISSENTS: none.
+CONFIDENCE: high
+=== END ===
+```
+
+This matches the stand-in deliberation in section 5 below — confirming
+that the multimodal-stand-in answer used in earlier revisions of this
+document was a faithful preview of the live ensemble output.
+
+## 5. Stand-in deliberation (multimodal, Claude Opus 4.7) — historical
+
+> **Note.** Sections 5–6 below are kept as a worked illustration of the
+> debate / judge protocol with a *single* multimodal model standing in
+> for all three agents. They were written when the live CLIs could not
+> be authenticated in the sandbox; with the section-3 fixes applied the
+> live ensemble now runs (see section 4 above). Treat this as
+> protocol-walkthrough material, not as the canonical answer.
 
 ### Round 1 — independent answers
 
@@ -321,7 +480,7 @@ CONFIDENCE: high
 === END ===
 ```
 
-## 5. How to reproduce
+## 6. How to reproduce
 
 ```sh
 # 1. Install the three subscription CLIs once.
@@ -334,7 +493,10 @@ codex   # follow prompts
 gemini  # follow prompts
 claude  # follow prompts
 
-# 3. Run the orchestrator on the image.
+# 3. Run the orchestrator on the image. The wrappers in lib/agents.sh
+#    already apply the section-3 fixes (gemini --skip-trust + claude
+#    nested-session env-strip), so this works as-is from inside Claude
+#    Code, codespaces, /tmp worktrees, CI runners, etc.
 ./ensemble.sh \
     --image img/temp.png \
     --agents codex,claude,gemini \
@@ -344,3 +506,15 @@ claude  # follow prompts
 
 # Final answer + per-round transcripts land in runs/<timestamp>/.
 ```
+
+If a CLI is on a non-default path, override it via env vars:
+
+```sh
+CODEX_BIN="$(npm root)/.bin/codex" \
+GEMINI_BIN="$(npm root)/.bin/gemini" \
+CLAUDE_BIN=/home/codespace/.local/bin/claude \
+./ensemble.sh --image img/temp.png …
+```
+
+The same env-var hooks (`CODEX_ARGS`, `CLAUDE_ARGS`, `GEMINI_ARGS`) let
+you adjust flags per CLI without editing the wrapper.
