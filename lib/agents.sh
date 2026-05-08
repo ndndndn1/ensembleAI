@@ -24,6 +24,13 @@
 # spawned `claude` subprocess, cause it to fail silently / refuse to start a
 # new session. We strip them on every claude invocation (idempotent — no
 # effect if they aren't set).
+#
+# This list was verified against Claude Code v2.1.133 (2026-05-08) by
+# running `env | grep -iE 'claude|anthropic|^AI_AGENT' | cut -d= -f1` from
+# inside an active Claude Code session. If a future Claude Code release
+# adds a new session-marker variable, add it here. Symptom of a missed
+# marker: `claude` exits non-zero with empty stderr when invoked from
+# inside Claude Code.
 _CLAUDE_NESTED_ENV_STRIP=(
   CLAUDECODE
   CLAUDE_CODE_SESSION_ID

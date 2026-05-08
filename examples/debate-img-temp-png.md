@@ -9,6 +9,25 @@ ensembleAI debate protocol.
 - **Image** — [`img/temp.png`](../img/temp.png) (cross-section diagram of a
   semiconductor device)
 
+### Tested CLI versions
+
+The fixes and run output below were verified against the following exact
+versions on 2026-05-08. Different versions may behave differently — most
+notably the env-var list in §3.2 is tied to the Claude Code release that
+spawned the orchestrator.
+
+| Component                  | Version                  | Channel                                  |
+| -------------------------- | ------------------------ | ---------------------------------------- |
+| `@openai/codex`            | `0.129.0` (research preview) | `npm i @openai/codex`                |
+| `@google/gemini-cli`       | `0.41.2`                 | `npm install @google/gemini-cli`         |
+| `claude` (Claude Code CLI) | `2.1.133`                | `curl -fsSL https://claude.ai/install.sh \| bash` |
+| Host environment           | GitHub Codespaces, Linux 6.8.0-1044-azure | non-root user `codespace` |
+| Outer agent (which spawned the run) | Claude Code `2.1.133` (so the §3.2 nested-session symptom *was* reproducible here) | — |
+
+`package.json` pins codex/gemini with caret ranges, so a fresh
+`npm install` will pick up newer minor versions; if any of the section-3
+fixes regress, re-pin to the versions above as a smoke test.
+
 ---
 
 ## 1. Reference commands (from `README.md`)
@@ -98,6 +117,16 @@ Equivalently, exporting `GEMINI_CLI_TRUST_WORKSPACE=true` in the parent
 shell also works. `--skip-trust` is preferred because it scopes the
 relaxation to the single invocation rather than the whole shell session.
 
+> ⚠️ **Security caveat.** `--skip-trust` declares that you trust the
+> contents of the current working directory — including any `.gemini/`
+> config, `GEMINI.md` instructions, or other files gemini may auto-read.
+> ensembleAI is a user-initiated orchestrator, so the assumption is
+> reasonable for repos *you wrote or audited*. **Avoid running this
+> orchestrator (or `gemini --skip-trust` directly) inside a freshly
+> cloned third-party repo before reviewing what's in it.** If you need
+> to debate over an unfamiliar repo, do it from a sibling directory
+> with the image copied out, not from the repo root.
+
 ### 3.2 Claude — nested-session / silent-exit when running inside Claude Code
 
 **Symptom.** When `claude --dangerously-skip-permissions -p …` is spawned
@@ -122,6 +151,14 @@ session, don't start a new one":
 (This is a stricter sibling of the *"`--dangerously-skip-permissions`
 cannot be used with root/sudo privileges"* error you get when running as
 root — same defensive design, different trigger.)
+
+> 🔄 **Version pin.** The marker list above was captured by running
+> `env | grep -iE 'claude|anthropic|^AI_AGENT' | cut -d= -f1` from
+> inside an active **Claude Code v2.1.133** session (the same release
+> used to verify the rest of this document). A future Claude Code
+> release may add a new marker; if so, the symptom is the same silent
+> non-zero exit and the fix is to add the new variable to
+> `_CLAUDE_NESTED_ENV_STRIP` in `lib/agents.sh`.
 
 **Fix.** Strip those variables from the spawned process's environment
 using `env -u`. `lib/agents.sh` now does this for every `claude` call:
@@ -251,17 +288,123 @@ CONFIDENCE: high
 === END ===
 ```
 
-This matches the stand-in deliberation in section 5 below — confirming
+This matches the stand-in deliberation in section 6 below — confirming
 that the multimodal-stand-in answer used in earlier revisions of this
 document was a faithful preview of the live ensemble output.
 
-## 5. Stand-in deliberation (multimodal, Claude Opus 4.7) — historical
+## 5. Test limitations and caveats
 
-> **Note.** Sections 5–6 below are kept as a worked illustration of the
-> debate / judge protocol with a *single* multimodal model standing in
-> for all three agents. They were written when the live CLIs could not
-> be authenticated in the sandbox; with the section-3 fixes applied the
-> live ensemble now runs (see section 4 above). Treat this as
+What §3 and §4 *do* establish, and what they *don't*. Reading these as
+a single "the orchestrator works perfectly on images" is too strong; the
+honest scope is narrower.
+
+### 5.1 Verified — each CLI does real vision-based image input
+
+Worry: did `codex --image` actually pass the bytes to a vision model, or
+did it just hand the path to a text model that guessed from the
+filename `temp.png` plus the prompt's word "device"?
+
+**Verification.** A sanity-check image was generated locally with a
+content-free filename and pixel content that no model could plausibly
+have memorized:
+
+```sh
+# 8x8 random-pixel PNG, deterministic seed unique to this run, named
+# canvas.png so the filename gives no semantic hint.
+python3 - <<'PY'
+import struct, zlib, random
+random.seed(20260508); W=H=8; raw=b''
+for _ in range(H):
+    raw += b'\x00'
+    for _ in range(W):
+        raw += bytes([random.randint(0,255) for _ in range(3)])
+def chunk(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
+sig=b'\x89PNG\r\n\x1a\n'
+ihdr=struct.pack('>IIBBBBB',W,H,8,2,0,0,0)
+open('/tmp/img-blind-test/canvas.png','wb').write(
+    sig+chunk(b'IHDR',ihdr)+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b''))
+PY
+```
+
+Each CLI was then asked: *"Describe what you see in 2 sentences. List
+the dominant colors. Do NOT guess from the filename."* The actual
+responses (verbatim, single run, 2026-05-08):
+
+| CLI    | Response (key fragments)                                                                                                  | Verdict |
+| ------ | ------------------------------------------------------------------------------------------------------------------------- | ------- |
+| codex  | *"tiny pixelated square… scattered bright multicolored pixels forming an abstract pattern. Dominant colors: black, red, green, blue, cyan, magenta, yellow, white."* | sees pixel-grid structure |
+| claude | *"very small, low-resolution graphic showing a few blocky pixel regions… pink/magenta on the left, black in the middle, green on the right."* | sees blocks + colors |
+| gemini | *"soft, out-of-focus blobs of color… abstract, ethereal effect. Dominant colors: dark green, magenta, white, black, teal."* | sees colors (mis-reads resolution) |
+
+The ground-truth pixel set contains greens (e.g. `(25,73,8)`,
+`(30,168,43)`), magentas (`(217,10,216)`), near-blacks (`(13,0,21)`),
+teals (`(24,182,168)`) and bright whites — every color call across the
+three CLIs is consistent with the actual distribution. None of them
+could have produced these specific color sets from the filename
+"canvas.png" alone.
+
+**Conclusion.** All three CLIs (`codex`, `claude`, `gemini` at the
+versions above) genuinely route the image to a vision-capable model.
+ensembleAI's `--image` path is not a fallback; it's real multimodal
+deliberation.
+
+### 5.2 Not verified — that consensus on `img/temp.png` reflects deliberation
+
+The Round-1 conclusions in §4 all converge on "vertical NPN BJT
+cross-section in a junction-isolated bipolar IC process." That's
+genuinely what the image shows, but it is *also* one of the most
+canonical figures in semiconductor textbooks (Sedra/Smith, Gray/Meyer,
+Streetman). The prior probability that any modern multimodal model lands
+on this answer with high confidence — independently of the other two —
+is very high.
+
+So the §4 run validates **that the orchestrator collects, votes on, and
+synthesizes real per-CLI answers**. It does **not** establish that
+debate / judge synthesis adds value over a single CLI for *this*
+particular image — three confident-and-correct independent answers don't
+exercise the disagreement-handling machinery.
+
+A more discriminating test would use an image where the three CLIs
+plausibly disagree:
+
+- Ambiguous or low-quality micrographs (SEM/TEM with no scale bar).
+- Non-canonical or hand-drawn device cross-sections.
+- Multi-object scenes where each agent might foreground a different
+  object.
+- Charts where the axes/units are missing or unusual.
+
+Such tests are out of scope for this example file; if you add one, drop
+a sibling under `examples/` rather than retro-fitting this document so
+the *known-easy* case here remains a clean baseline.
+
+### 5.3 Other scope notes
+
+- **Single-run, no statistical significance.** The §4 run was executed
+  once. Network blips, model server-side updates, or rate limiting can
+  flip individual agents into the "agent failed" fallback path even
+  with the §3 fixes applied. Re-run `./ensemble.sh` if any agent
+  produces the synthetic block instead of a real STRUCTURED block.
+- **One outer agent type tested.** The §3.2 nested-session fix was
+  verified specifically when the orchestrator is launched from inside
+  Claude Code itself. A different parent agent runtime (e.g. an OpenAI
+  Codex-driven shell, or a plain SSH session with the CLAUDECODE env
+  vars intentionally set) was *not* tested.
+- **Non-root user only.** All runs were as the unprivileged
+  `codespace` user. The earlier *"`--dangerously-skip-permissions`
+  cannot be used with root/sudo"* error path is documented in §3.2 but
+  not re-verified.
+- **English prompts only.** The topic was English. Behaviour with
+  non-English prompts (especially CJK) on the same image was not
+  evaluated.
+
+## 6. Stand-in deliberation (multimodal, Claude Opus 4.7) — historical
+
+> **Note.** This section is kept as a worked illustration of the debate
+> / judge protocol with a *single* multimodal model standing in for all
+> three agents. It was written when the live CLIs could not be
+> authenticated in the sandbox; with the section-3 fixes applied the
+> live ensemble now runs (see section 4 above), and section 5 documents
+> what that run does and does not establish. Treat this section as
 > protocol-walkthrough material, not as the canonical answer.
 
 ### Round 1 — independent answers
@@ -480,7 +623,7 @@ CONFIDENCE: high
 === END ===
 ```
 
-## 6. How to reproduce
+## 7. How to reproduce
 
 ```sh
 # 1. Install the three subscription CLIs once.
