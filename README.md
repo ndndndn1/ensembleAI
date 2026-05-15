@@ -98,8 +98,9 @@ Common flags:
 | `-r, --rounds N`            | `1`              | debate rounds **after** round 1                       |
 | `-a, --agents LIST`         | auto-detect      | comma-separated subset of `codex,claude,gemini`       |
 | `-j, --judge NAME`          | `claude`         | which agent acts as judge                             |
-| `-m, --mode MODE`           | `debate`         | `debate` \| `vote` \| `self-consistency`              |
+| `-m, --mode MODE`           | `debate`         | `debate` \| `vote` \| `self-consistency` \| `chat`    |
 | `--self-n N`                | `3`              | runs per agent in `self-consistency` mode             |
+| `--max-turns N`             | `9`              | hard cap on total turns in `chat` mode                |
 | `-o, --out DIR`             | `runs/<ts>`      | where transcripts and the final answer are written    |
 | `--no-judge`                | off              | skip the judge step (fall back to vote-only output)   |
 | `--dry-run`                 | off              | print prompts but do not call any agent               |
@@ -118,6 +119,9 @@ Examples:
 
 # Image input: all three CLIs reason about the same picture
 ./ensemble.sh --image img/temp.png "Explain what this image shows."
+
+# Chat: free-form turn-by-turn dialogue, no per-topic prompt file
+./ensemble.sh -m chat "Should we use Rust or Go for the ingest service?"
 ```
 
 A worked image-debate example with the exact reference commands and the
@@ -172,6 +176,47 @@ AGENT_TIMEOUT=600    # seconds, per-call
 - **`self-consistency`** — single agent (or subset) answers `--self-n` times
   in parallel and we vote on the conclusions. Useful when only one CLI is
   available, or to quantify variance.
+- **`chat`** — turn-by-turn conversation rather than synchronized rounds.
+  Each agent in turn sees the full running transcript and adds one short
+  message ending with `[AGREE]`, `[EXTEND]`, or `[DISAGREE: ...]`. The
+  deliberation ends as soon as every agent's most recent turn is `[AGREE]`
+  consecutively, or at `--max-turns` (default 9). A short, fixed system
+  prompt is used for every turn — no per-topic prompt files. The judge
+  then synthesizes a `final.md` from the transcript.
+
+### `chat` mode protocol
+
+```
+[Topic + small system prompt]
+         │
+         ▼
+   ┌─→ turn N — agent A speaks (sees full transcript) ──┐
+   │                                                     │
+   │   turn N+1 — agent B speaks (sees full transcript)  │
+   │                                                     │
+   └── turn N+2 — agent C speaks (sees full transcript) ─┘
+         │
+         ▼  (if last len(agents) turns are all [AGREE])
+   Judge synthesizes final.md
+```
+
+Chat-mode outputs land under `runs/<ts>/`:
+
+```
+runs/<ts>/
+├── topic.md
+├── run.meta
+├── chat/
+│   ├── turn-01-codex.md         # codex's first turn (free-form)
+│   ├── turn-01-codex.prompt     # exact prompt sent
+│   ├── turn-02-claude.md
+│   └── ...
+├── chat.md                      # running transcript (the "memory")
+├── chat.signals                 # last per-agent signal (AGREE/EXTEND/...)
+├── chat.termination             # "converged ..." or "max-turns reached"
+├── judge.prompt                 # judge prompt over the full transcript
+└── final.md                     # ← the optimal conclusion
+```
 
 ## Notes
 
