@@ -17,10 +17,12 @@
 #                          CLI's native image syntax)
 #   -r, --rounds N         number of debate rounds after round 1 (default 1)
 #   -a, --agents LIST      comma-separated subset of: codex,claude,gemini
-#                          (default: all available)
+#                          (default: all available); also sets turn order
+#                          for `chat` mode
 #   -j, --judge NAME       judge agent: codex|claude|gemini (default: claude)
-#   -m, --mode MODE        debate (default) | vote | self-consistency
+#   -m, --mode MODE        debate (default) | vote | self-consistency | chat
 #       --self-n N         in self-consistency mode, runs per agent (default 3)
+#       --max-turns N      in chat mode, hard cap on total turns (default 9)
 #   -o, --out DIR          output directory (default: runs/<timestamp>)
 #       --no-judge         skip the judge step
 #       --dry-run          print what would happen, but do not call agents
@@ -40,6 +42,7 @@ AGENTS_INPUT=""
 JUDGE="claude"
 MODE="debate"
 SELF_N=3
+MAX_TURNS=9
 OUT_DIR=""
 TOPIC_FILE=""
 TOPIC_INLINE=""
@@ -64,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     -j|--judge)   JUDGE="$2"; shift 2 ;;
     -m|--mode)    MODE="$2"; shift 2 ;;
     --self-n)     SELF_N="$2"; shift 2 ;;
+    --max-turns)  MAX_TURNS="$2"; shift 2 ;;
     -o|--out)     OUT_DIR="$2"; shift 2 ;;
     --no-judge)   NO_JUDGE=1; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
@@ -141,13 +145,18 @@ printf '%s\n' "$TOPIC" > "$OUT_DIR/topic.md"
   echo "mode: $MODE"
   echo "agents: ${AGENTS[*]}"
   echo "rounds: $ROUNDS"
+  echo "max_turns: $MAX_TURNS"
   echo "judge: $JUDGE"
   echo "self_n: $SELF_N"
   echo "image: ${IMAGE_PATH:-}"
 } > "$OUT_DIR/run.meta"
 
 echo ">>> ensembleAI run: $OUT_DIR" >&2
-echo ">>> mode=$MODE  agents=${AGENTS[*]}  rounds=$ROUNDS  judge=$JUDGE  image=${IMAGE_PATH:-none}" >&2
+if [[ "$MODE" == "chat" ]]; then
+  echo ">>> mode=$MODE  agents=${AGENTS[*]}  max_turns=$MAX_TURNS  judge=$JUDGE  image=${IMAGE_PATH:-none}" >&2
+else
+  echo ">>> mode=$MODE  agents=${AGENTS[*]}  rounds=$ROUNDS  judge=$JUDGE  image=${IMAGE_PATH:-none}" >&2
+fi
 
 # -------- prompt builders --------
 render() {
@@ -252,6 +261,111 @@ run_vote_only() {
   run_round 1 ""
 }
 
+run_chat() {
+  # Turn-by-turn dialogue. Each turn the next agent (round-robin over
+  # AGENTS) sees the full running transcript and adds one short message
+  # ending with [AGREE] / [EXTEND] / [DISAGREE: ...]. When the last
+  # n_agents turns are all [AGREE], the chat converges. Otherwise it
+  # stops at MAX_TURNS.
+  local chat_dir="$OUT_DIR/chat"
+  mkdir -p "$chat_dir"
+  local transcript=""
+  declare -A last_signal=()
+  local termination=""
+  local consecutive_agree=0
+  local n_agents=${#AGENTS[@]}
+  local agent_list
+  agent_list="$(IFS=, ; echo "${AGENTS[*]}")"
+
+  echo ">>> chat: max_turns=$MAX_TURNS, order=${AGENTS[*]}" >&2
+
+  local turn=1
+  while (( turn <= MAX_TURNS )); do
+    local speaker_idx=$(( (turn - 1) % n_agents ))
+    local speaker="${AGENTS[$speaker_idx]}"
+    local turn_fmt
+    turn_fmt="$(printf '%02d' "$turn")"
+    local out="$chat_dir/turn-${turn_fmt}-${speaker}.md"
+    local err="$chat_dir/turn-${turn_fmt}-${speaker}.err"
+
+    local trans_for_prompt
+    if [[ -z "$transcript" ]]; then
+      trans_for_prompt="(No turns yet — you are the first speaker.)"
+    else
+      trans_for_prompt="$transcript"
+    fi
+
+    local prompt
+    prompt="$(render "$HERE/prompts/chat-system.md" \
+        "TOPIC=$TOPIC" \
+        "TRANSCRIPT=$trans_for_prompt" \
+        "AGENT=$speaker" \
+        "AGENT_LIST=$agent_list")"
+    printf '%s\n' "$prompt" > "$chat_dir/turn-${turn_fmt}-${speaker}.prompt"
+
+    echo ">>> turn $turn/$MAX_TURNS — $speaker" >&2
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf '%s\n' "[dry-run] $speaker turn $turn" "" "[AGREE]" > "$out"
+    else
+      if ! printf '%s\n' "$prompt" | agent_run "$speaker" > "$out" 2> "$err"; then
+        echo "warn: $speaker failed at turn $turn (see $err)" >&2
+        printf '%s\n' "(agent $speaker failed at turn $turn)" "" \
+          "[DISAGREE: agent failed to respond]" > "$out"
+      fi
+    fi
+
+    # Extract signal from the last non-empty line of the response.
+    local last_line signal
+    last_line="$(awk 'NF{l=$0} END{print l}' "$out")"
+    case "$last_line" in
+      *"[AGREE]"*)           signal="AGREE" ;;
+      *"[EXTEND]"*)          signal="EXTEND" ;;
+      *"[DISAGREE:"*"]"*)    signal="DISAGREE" ;;
+      *)                     signal="NONE" ;;
+    esac
+    last_signal["$speaker"]="$signal"
+    echo ">>>   signal: $signal" >&2
+
+    # Append to running transcript and persist a readable chat.md.
+    transcript+="### Turn $turn — $speaker"$'\n\n'
+    transcript+="$(cat "$out")"$'\n\n'
+    {
+      echo "# Conversation — chat mode"
+      echo
+      printf '%s' "$transcript"
+    } > "$OUT_DIR/chat.md"
+
+    # Convergence: every agent has spoken at least once AND the last
+    # n_agents consecutive turns all ended with [AGREE].
+    if [[ "$signal" == "AGREE" ]]; then
+      consecutive_agree=$(( consecutive_agree + 1 ))
+    else
+      consecutive_agree=0
+    fi
+    if (( turn >= n_agents )) && (( consecutive_agree >= n_agents )); then
+      termination="converged after turn $turn ($n_agents consecutive [AGREE])"
+      echo ">>> $termination" >&2
+      break
+    fi
+
+    turn=$(( turn + 1 ))
+  done
+
+  if [[ -z "$termination" ]]; then
+    termination="max-turns ($MAX_TURNS) reached without consecutive consensus"
+  fi
+  printf '%s\n' "$termination" > "$OUT_DIR/chat.termination"
+
+  # Per-agent final-signal summary, used by the judge prompt.
+  local signals_md=""
+  local a
+  for a in "${AGENTS[@]}"; do
+    signals_md+="- $a: ${last_signal[$a]:-NONE}"$'\n'
+  done
+  printf '%s' "$signals_md" > "$OUT_DIR/chat.signals"
+}
+
 run_self_consistency() {
   # Each selected agent answers N times independently. Treat each (agent,run)
   # as a separate voter. Useful when you only have one model available, or
@@ -285,68 +399,122 @@ case "$MODE" in
   debate)            run_debate ;;
   vote)              run_vote_only ;;
   self-consistency)  run_self_consistency ;;
+  chat)              run_chat ;;
   *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 
 # -------- aggregation --------
-last_round_dir() {
-  ls -d "$OUT_DIR"/round* 2>/dev/null | sort -V | tail -n1
-}
-
-VOTE_DIR="$(last_round_dir)"
-{
-  echo "# Vote summary — $(basename "$VOTE_DIR")"
-  echo
-  majority_vote "$VOTE_DIR"
-} > "$OUT_DIR/vote.md"
-
-echo >&2
-echo ">>> vote summary:" >&2
-sed 's/^/    /' "$OUT_DIR/vote.md" >&2
-
-# -------- judge --------
 final_path="$OUT_DIR/final.md"
 
-if [[ "$NO_JUDGE" -eq 1 || "$MODE" == "vote" || "$MODE" == "self-consistency" ]]; then
-  # Skip judge: produce a final.md from the vote winner.
-  {
-    echo "# Final answer (no judge)"
-    echo
-    echo "## Vote summary"
-    cat "$OUT_DIR/vote.md"
-    echo
-    echo "## Per-agent last-round answers"
-    for f in "$VOTE_DIR"/*.md; do
-      [[ -f "$f" ]] || continue
-      echo "### $(basename "$f" .md)"
+if [[ "$MODE" == "chat" ]]; then
+  # Chat mode skips the round-based vote summary entirely. The judge sees
+  # the conversation transcript plus the termination reason and per-agent
+  # final signal.
+  echo >&2
+  echo ">>> chat termination: $(cat "$OUT_DIR/chat.termination")" >&2
+  echo ">>> per-agent signals:" >&2
+  sed 's/^/    /' "$OUT_DIR/chat.signals" >&2
+
+  if [[ "$NO_JUDGE" -eq 1 ]]; then
+    {
+      echo "# Final answer (no judge — chat transcript only)"
       echo
-      cat "$f"
+      echo "Termination: $(cat "$OUT_DIR/chat.termination")"
       echo
-    done
-  } > "$final_path"
-else
-  if ! agent_available "$JUDGE"; then
-    echo "warn: judge '$JUDGE' not available, falling back to first agent: ${AGENTS[0]}" >&2
-    JUDGE="${AGENTS[0]}"
-  fi
-  echo ">>> judge: $JUDGE" >&2
-  TRANSCRIPT="$(prior_rounds_text "$(ls -d "$OUT_DIR"/round* | wc -l | tr -d ' ')")"
-  VOTE_SUMMARY="$(cat "$OUT_DIR/vote.md")"
-  judge_prompt="$(render "$HERE/prompts/judge.md" \
-      "TOPIC=$TOPIC" \
-      "TRANSCRIPT=$TRANSCRIPT" \
-      "VOTE_SUMMARY=$VOTE_SUMMARY")"
-  printf '%s\n' "$judge_prompt" > "$OUT_DIR/judge.prompt"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] judge $JUDGE would be invoked" > "$final_path"
+      echo "## Per-agent final signal"
+      echo
+      cat "$OUT_DIR/chat.signals"
+      echo
+      echo "## Transcript"
+      echo
+      cat "$OUT_DIR/chat.md"
+    } > "$final_path"
   else
-    if ! printf '%s\n' "$judge_prompt" | agent_run "$JUDGE" > "$final_path" 2> "$OUT_DIR/judge.err"; then
-      echo "warn: judge '$JUDGE' failed (see $OUT_DIR/judge.err) — emitting vote-only fallback" >&2
-      {
-        echo "# Final answer (judge failed; vote-only)"
+    if ! agent_available "$JUDGE"; then
+      echo "warn: judge '$JUDGE' not available, falling back to first agent: ${AGENTS[0]}" >&2
+      JUDGE="${AGENTS[0]}"
+    fi
+    echo ">>> judge: $JUDGE" >&2
+    TRANSCRIPT="$(cat "$OUT_DIR/chat.md")"
+    TERMINATION="$(cat "$OUT_DIR/chat.termination")"
+    SIGNALS="$(cat "$OUT_DIR/chat.signals")"
+    judge_prompt="$(render "$HERE/prompts/judge-chat.md" \
+        "TOPIC=$TOPIC" \
+        "TRANSCRIPT=$TRANSCRIPT" \
+        "TERMINATION=$TERMINATION" \
+        "SIGNALS=$SIGNALS")"
+    printf '%s\n' "$judge_prompt" > "$OUT_DIR/judge.prompt"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "[dry-run] judge $JUDGE would be invoked" > "$final_path"
+    else
+      if ! printf '%s\n' "$judge_prompt" | agent_run "$JUDGE" > "$final_path" 2> "$OUT_DIR/judge.err"; then
+        echo "warn: judge '$JUDGE' failed (see $OUT_DIR/judge.err) — emitting transcript-only fallback" >&2
+        {
+          echo "# Final answer (judge failed; transcript-only)"
+          echo
+          echo "Termination: $TERMINATION"
+          echo
+          cat "$OUT_DIR/chat.md"
+        } > "$final_path"
+      fi
+    fi
+  fi
+else
+  last_round_dir() {
+    ls -d "$OUT_DIR"/round* 2>/dev/null | sort -V | tail -n1
+  }
+
+  VOTE_DIR="$(last_round_dir)"
+  {
+    echo "# Vote summary — $(basename "$VOTE_DIR")"
+    echo
+    majority_vote "$VOTE_DIR"
+  } > "$OUT_DIR/vote.md"
+
+  echo >&2
+  echo ">>> vote summary:" >&2
+  sed 's/^/    /' "$OUT_DIR/vote.md" >&2
+
+  if [[ "$NO_JUDGE" -eq 1 || "$MODE" == "vote" || "$MODE" == "self-consistency" ]]; then
+    {
+      echo "# Final answer (no judge)"
+      echo
+      echo "## Vote summary"
+      cat "$OUT_DIR/vote.md"
+      echo
+      echo "## Per-agent last-round answers"
+      for f in "$VOTE_DIR"/*.md; do
+        [[ -f "$f" ]] || continue
+        echo "### $(basename "$f" .md)"
         echo
-        cat "$OUT_DIR/vote.md"
-      } > "$final_path"
+        cat "$f"
+        echo
+      done
+    } > "$final_path"
+  else
+    if ! agent_available "$JUDGE"; then
+      echo "warn: judge '$JUDGE' not available, falling back to first agent: ${AGENTS[0]}" >&2
+      JUDGE="${AGENTS[0]}"
+    fi
+    echo ">>> judge: $JUDGE" >&2
+    TRANSCRIPT="$(prior_rounds_text "$(ls -d "$OUT_DIR"/round* | wc -l | tr -d ' ')")"
+    VOTE_SUMMARY="$(cat "$OUT_DIR/vote.md")"
+    judge_prompt="$(render "$HERE/prompts/judge.md" \
+        "TOPIC=$TOPIC" \
+        "TRANSCRIPT=$TRANSCRIPT" \
+        "VOTE_SUMMARY=$VOTE_SUMMARY")"
+    printf '%s\n' "$judge_prompt" > "$OUT_DIR/judge.prompt"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "[dry-run] judge $JUDGE would be invoked" > "$final_path"
+    else
+      if ! printf '%s\n' "$judge_prompt" | agent_run "$JUDGE" > "$final_path" 2> "$OUT_DIR/judge.err"; then
+        echo "warn: judge '$JUDGE' failed (see $OUT_DIR/judge.err) — emitting vote-only fallback" >&2
+        {
+          echo "# Final answer (judge failed; vote-only)"
+          echo
+          cat "$OUT_DIR/vote.md"
+        } > "$final_path"
+      fi
     fi
   fi
 fi
